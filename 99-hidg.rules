@@ -1,0 +1,4 @@
+# Install as /etc/udev/rules.d/99-hidg.rules
+# Lets the `arduino` user (and therefore an Arduino App's Python process) write
+# HID reports to /dev/hidg0 without root. `arduino` is already in dialout.
+KERNEL=="hidg[0-9]*", SUBSYSTEM=="hidg", MODE="0660", GROUP="dialout"

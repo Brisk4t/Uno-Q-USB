@@ -1,0 +1,350 @@
+#!/bin/sh
+# Adds HID functions to the ADB USB gadget (g1) built by
+# /usr/lib/android-sdk/platform-tools/adbd-usb-gadget.
+#
+# Two HID functions are exposed as a compound device: a boot-protocol
+# keyboard (hid.usb0) and a 3-axis / 2-button game controller (hid.usb1).
+#
+# Hooked into adbd.service via the drop-in 10-hid.conf so that:
+#   setup     runs AFTER  adbd-usb-gadget setup   (gadget exists, UDC not yet bound)
+#   teardown  runs BEFORE adbd-usb-gadget reset   (so rmdir of c.1/g1 can succeed)
+
+set -e
+
+CONFIGFS_DIR="/sys/kernel/config/usb_gadget/g1"
+CONF_DIR="${CONFIGFS_DIR}/configs/c.1"
+
+# Only used by the live 'add' command below - normal boot-time setup/teardown
+# leaves UDC binding to adbd.service, which writes it after this script runs.
+UDC_NAME="4e00000.usb"
+
+# hidg character devices are numbered by the kernel in the order the
+# functions are bound to the UDC, which follows the setup_function() call
+# order in setup() below (keyboard, then joystick). Update these if that
+# order ever changes.
+HID_DEV_KEYBOARD="/dev/hidg0"
+HID_DEV_JOYSTICK="/dev/hidg1"
+
+
+# --- Boot-protocol keyboard (change these three + the descriptor for a mouse) ---
+FUNC_KEYBOARD="hid.usb0"
+HID_PROTOCOL=1      # 1 = keyboard, 2 = mouse
+HID_SUBCLASS=1      # 1 = boot interface subclass, 0 = none
+HID_REPORT_LENGTH=8 # bytes per interrupt-IN report
+
+# Standard boot keyboard report descriptor (USB HID Usage Tables + HID 1.11
+# Appendix B.1), one item per line as "HEX  # item"
+HID_REPORT_DESC_TABLE='
+05 01   # Usage Page (Generic Desktop)
+09 06   # Usage (Keyboard)
+a1 01   # Collection (Application)
+05 07   #   Usage Page (Key Codes)
+19 e0   #   Usage Minimum (224)  = Left Control
+29 e7   #   Usage Maximum (231)  = Right GUI
+15 00   #   Logical Minimum (0)
+25 01   #   Logical Maximum (1)
+75 01   #   Report Size (1)
+95 08   #   Report Count (8)
+81 02   #   Input (Data,Var,Abs)      - modifier byte, 8 flags
+95 01   #   Report Count (1)
+75 08   #   Report Size (8)
+81 03   #   Input (Const)             - reserved byte
+95 05   #   Report Count (5)
+75 01   #   Report Size (1)
+05 08   #   Usage Page (LEDs)
+19 01   #   Usage Minimum (1)   = Num Lock
+29 05   #   Usage Maximum (5)   = Kana
+91 02   #   Output (Data,Var,Abs)     - LED report from host
+95 01   #   Report Count (1)
+75 03   #   Report Size (3)
+91 03   #   Output (Const)            - LED report padding
+95 06   #   Report Count (6)
+75 08   #   Report Size (8)
+15 00   #   Logical Minimum (0)
+25 65   #   Logical Maximum (101)
+05 07   #   Usage Page (Key Codes)
+19 00   #   Usage Minimum (0)
+29 65   #   Usage Maximum (101)
+81 00   #   Input (Data,Ary)          - up to 6 simultaneous keycodes
+c0      # End Collection
+'
+
+# --- Game controller: 3 analog axes (X/Y/Z) + 2 buttons, no boot protocol ---
+FUNC_JOYSTICK="hid.usb1"
+HID2_PROTOCOL=0      # 0 = none (boot protocol is only defined for kbd/mouse)
+HID2_SUBCLASS=0      # 0 = no boot interface support
+HID2_REPORT_LENGTH=4 # 3 axis bytes + 1 button byte, per report below
+
+HID2_REPORT_DESC_TABLE='
+05 01   # Usage Page (Generic Desktop)
+09 04   # Usage (Joystick)
+a1 01   # Collection (Application)
+a1 00   #   Collection (Physical)
+09 30   #     Usage (X)
+09 31   #     Usage (Y)
+09 32   #     Usage (Z)
+15 81   #     Logical Minimum (-127)
+25 7f   #     Logical Maximum (127)
+75 08   #     Report Size (8)
+95 03   #     Report Count (3)
+81 02   #     Input (Data,Var,Abs)      - 3 signed 8-bit axes
+c0      #   End Collection
+05 09   #   Usage Page (Button)
+19 01   #   Usage Minimum (1)   = Button 1
+29 02   #   Usage Maximum (2)   = Button 2
+15 00   #   Logical Minimum (0)
+25 01   #   Logical Maximum (1)
+75 01   #   Report Size (1)
+95 02   #   Report Count (2)
+81 02   #   Input (Data,Var,Abs)      - 2 buttons
+95 06   #   Report Count (6)
+75 01   #   Report Size (1)
+81 03   #   Input (Const)             - padding to a full byte
+c0      # End Collection
+'
+
+# Table -> raw bytes, written in one printf (one write(2) call, which is
+# what configfs expects for report_desc) so report_desc_length comes out
+# right - the kernel derives it from the byte count of that single write
+# (f_hid_opts_report_desc_store in f_hid.c), there's no separate length attr.
+hid_report_desc() {
+    table="$1"
+    fmt=""
+    for hex in $(printf '%s\n' "${table}" | sed 's/#.*//'); do
+        fmt="${fmt}\\$(printf '%03o' "0x${hex}")"
+    done
+    printf '%b' "${fmt}"
+}
+
+# Same octal-escape trick as hid_report_desc(), but for a fixed list of hex
+# byte values passed as separate arguments - used to write interrupt-IN
+# reports (joystick/keyboard state) rather than the report descriptor itself.
+hex_bytes() {
+    fmt=""
+    for hex in "$@"; do
+        fmt="${fmt}\\$(printf '%03o' "0x${hex}")"
+    done
+    printf '%b' "${fmt}"
+}
+
+# Allow local override of the above without editing this file.
+[ -r /etc/default/arduino-hid-gadget ] && . /etc/default/arduino-hid-gadget
+
+# $1=func name  $2=protocol  $3=subclass  $4=report_length  $5=report desc table
+setup_function() {
+    func="$1"
+    func_dir="${CONFIGFS_DIR}/functions/${func}"
+
+    mkdir -p "${func_dir}"
+
+    echo "$2" > "${func_dir}/protocol"
+    echo "$3" > "${func_dir}/subclass"
+    echo "$4" > "${func_dir}/report_length"
+    hid_report_desc "$5" > "${func_dir}/report_desc"
+
+    # Linking into c.1 is what makes the host see it. adbd.service's
+    # ExecStartPost writes the UDC afterwards, which binds the whole composite.
+    #
+    # configfs symlinks are resolved by the kernel at creation time (not
+    # ordinary VFS symlinks), and that resolution wants a path valid from the
+    # calling process's cwd - an absolute symname was seen to fail with
+    # ENOENT in live testing.
+    if [ ! -e "${CONF_DIR}/${func}" ]; then
+        i=0
+        until ( cd "${CONFIGFS_DIR}" && ln -s "functions/${func}" "configs/c.1/" )
+        do
+            i=$((i+1))
+            [ $i -ge 10 ] && { echo "ERROR: failed to link ${func} into configs/c.1" >&2; exit 1; }
+            sleep 1
+        done
+    fi
+}
+
+# $1=func name
+teardown_function() {
+    func="$1"
+    func_dir="${CONFIGFS_DIR}/functions/${func}"
+
+    # Must undo in this order, and must complete before adbd-usb-gadget reset
+    # tries to rmdir configs/c.1 and the gadget root.
+    rm -f  "${CONF_DIR}/${func}"
+    rmdir  "${func_dir}" 2>/dev/null || true
+}
+
+setup() {
+    # configfs asks for the module by alias when the directory is created,
+    # but load it explicitly so a failure is reported here and not silently.
+    modprobe usb_f_hid
+
+    [ -d "${CONF_DIR}" ] || {
+        echo "ERROR: ${CONF_DIR} missing - adbd-usb-gadget setup must run first" >&2
+        exit 1
+    }
+
+    setup_function "${FUNC_KEYBOARD}" "${HID_PROTOCOL}" "${HID_SUBCLASS}" \
+        "${HID_REPORT_LENGTH}" "${HID_REPORT_DESC_TABLE}"
+    setup_function "${FUNC_JOYSTICK}" "${HID2_PROTOCOL}" "${HID2_SUBCLASS}" \
+        "${HID2_REPORT_LENGTH}" "${HID2_REPORT_DESC_TABLE}"
+}
+
+teardown() {
+    # Reverse of setup order.
+    teardown_function "${FUNC_JOYSTICK}"
+    teardown_function "${FUNC_KEYBOARD}"
+}
+
+# Rebinds the UDC if it's currently unbound, and waits for the gadget to
+# reach the "configured" state. Same pattern as adbd-usb-gadget/adbd.service,
+# reimplemented here because 'add' (unlike setup) has to do its own
+# unbind/rebind instead of leaving it to adbd.service.
+rebind() {
+    if [ -z "$(cat "${CONFIGFS_DIR}/UDC" 2>/dev/null)" ]; then
+        echo "${UDC_NAME}" > "${CONFIGFS_DIR}/UDC" 2>/dev/null || true
+        i=0
+        while [ $i -lt 10 ]; do
+            st="$(cat "/sys/class/udc/${UDC_NAME}/state" 2>/dev/null)"
+            [ "$st" = "configured" ] && return 0
+            i=$((i+1))
+            sleep 1
+        done
+        echo "WARNING: UDC rebind did not reach 'configured' (last state: '${st}')" >&2
+    fi
+}
+
+# Runtime add: (re)creates and links both HID functions on an already-running
+# gadget, without going through adbd.service - e.g. for live testing after
+# boot. adbd WILL drop while the UDC is unbound. Safe to re-run; teardown
+# undoes it, or just replug/reboot to fall back to the boot-time config.
+add() {
+    echo "unbinding UDC (adb will drop here)"
+    echo "" > "${CONFIGFS_DIR}/UDC" 2>/dev/null || true
+
+    setup
+
+    rebind
+    echo "linked: $(ls "${CONF_DIR}/" | tr '\n' ' ')"
+    echo "hidg*:  $(ls /dev/hidg* 2>/dev/null | tr '\n' ' ')"
+}
+
+# Exercises the joystick function (hid.usb1): sweeps each of the 3 axes to
+# its max then min then back to neutral, then presses and releases each of
+# the 2 buttons in turn. Report layout matches HID2_REPORT_DESC_TABLE above:
+# byte0=X byte1=Y byte2=Z byte3=buttons(bit0=Button1,bit1=Button2).
+run_test() {
+    [ -e "${HID_DEV_JOYSTICK}" ] || {
+        echo "ERROR: ${HID_DEV_JOYSTICK} not present - run 'add' or ensure the gadget is set up" >&2
+        exit 1
+    }
+
+    neutral() { hex_bytes 00 00 00 00 > "${HID_DEV_JOYSTICK}"; }
+
+    echo "neutral"
+    neutral
+    sleep 0.3
+
+    for axis in X Y Z; do
+        case "${axis}" in
+            X) pos="7f 00 00 00"; neg="81 00 00 00" ;;
+            Y) pos="00 7f 00 00"; neg="00 81 00 00" ;;
+            Z) pos="00 00 7f 00"; neg="00 00 81 00" ;;
+        esac
+
+        echo "axis ${axis}: max (+127)"
+        # Unquoted on purpose: hex_bytes takes each byte as its own argument.
+        hex_bytes ${pos} > "${HID_DEV_JOYSTICK}"
+        sleep 0.3
+
+        echo "axis ${axis}: min (-127)"
+        hex_bytes ${neg} > "${HID_DEV_JOYSTICK}"
+        sleep 0.3
+
+        neutral
+        sleep 0.2
+    done
+
+    for btn in 1 2; do
+        case "${btn}" in
+            1) report="00 00 00 01" ;;
+            2) report="00 00 00 02" ;;
+        esac
+
+        echo "button ${btn}: press"
+        hex_bytes ${report} > "${HID_DEV_JOYSTICK}"
+        sleep 0.3
+
+        echo "button ${btn}: release"
+        neutral
+        sleep 0.2
+    done
+
+    echo "test complete"
+}
+
+# Looks up the USB HID boot-keyboard modifier/keycode for a single ASCII
+# character (a-z, A-Z, 0-9, space, '.', ','). Sets MOD ("00" or "02" for Left
+# Shift) and KEY (hex keycode); returns 1 for anything else, leaving MOD/KEY
+# unset, so the caller can skip it.
+char_to_keycode() {
+    c="$1"
+    letters="abcdefghijklmnopqrstuvwxyz"
+    digits="1234567890"
+    MOD="00"
+    case "${c}" in
+        [a-z])
+            rest="${letters#*"${c}"}"
+            pos=$(( ${#letters} - ${#rest} ))
+            KEY=$(printf '%02x' $((pos + 3)))
+            ;;
+        [A-Z])
+            lc=$(printf '%s' "${c}" | tr 'A-Z' 'a-z')
+            rest="${letters#*"${lc}"}"
+            pos=$(( ${#letters} - ${#rest} ))
+            KEY=$(printf '%02x' $((pos + 3)))
+            MOD="02"
+            ;;
+        [0-9])
+            rest="${digits#*"${c}"}"
+            pos=$(( ${#digits} - ${#rest} ))
+            KEY=$(printf '%02x' $((pos + 29)))
+            ;;
+        ' ') KEY="2c" ;;
+        '.') KEY="37" ;;
+        ',') KEY="36" ;;
+        *)
+            echo "sendstring: skipping unsupported character '${c}'" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Types $1 over the keyboard function (hid.usb0) one character at a time:
+# press (modifier + keycode), then release (all-zero report).
+sendstring() {
+    str="$1"
+    [ -n "${str}" ] || { echo "Usage: $0 sendstring <text>" >&2; exit 1; }
+    [ -e "${HID_DEV_KEYBOARD}" ] || {
+        echo "ERROR: ${HID_DEV_KEYBOARD} not present - run 'add' or ensure the gadget is set up" >&2
+        exit 1
+    }
+
+    while [ -n "${str}" ]; do
+        c="${str%"${str#?}"}"
+        str="${str#?}"
+
+        if char_to_keycode "${c}"; then
+            hex_bytes "${MOD}" 00 "${KEY}" 00 00 00 00 00 > "${HID_DEV_KEYBOARD}"
+            sleep 0.03
+            hex_bytes 00 00 00 00 00 00 00 00 > "${HID_DEV_KEYBOARD}"
+            sleep 0.03
+        fi
+    done
+}
+
+case "$1" in
+    setup)      setup ;;
+    teardown)   teardown ;;
+    add)        add ;;
+    test)       run_test ;;
+    sendstring) sendstring "$2" ;;
+    *) echo "Usage: $0 [setup|teardown|add|test|sendstring <text>]"; exit 1 ;;
+esac

@@ -2,17 +2,7 @@
 
 Adds two HID functions to the board's existing ADB USB gadget (`g1`), exposed
 as one compound device: a boot-protocol keyboard (`hid.usb0`) and a 3-axis /
-2-button game controller (`hid.usb1`). The UNO Q can type into, and drive a
-joystick on, whatever host it's plugged into, alongside `adb` and the
-existing serial ACM port. This is purely Linux-side USB gadget configuration.
-
-Status: module built, loaded, and the keyboard function (`hid.usb0`) verified
-live (enumerated on the host as a 4th, HID-class interface; a test keystroke
-landed via `/dev/hidg0`). The joystick function (`hid.usb1`) and the
-`arduino-hid-gadget test` / `sendstring` live-test commands (§5) are
-implemented but not yet exercised against real hardware. Neither function is
-wired into the boot sequence yet — see
-[6. Making it persistent](#6-making-it-persistent-across-boots).
+2-button game controller (`hid.usb1`).
 
 ## 1. Why a kernel module was needed
 
@@ -50,9 +40,6 @@ So step one was building it out-of-tree for the exact running kernel
 
 ## 3. Building `usb_f_hid.ko`
 
-**No root required for any of this** — it's all downloads, extraction, and
-an out-of-tree module build against a locally-extracted headers package.
-
 ### 3.1 Get matching kernel headers
 
 Arduino's own apt repo carries headers that exactly match the running
@@ -73,12 +60,11 @@ source, only `include/`.
 ### 3.2 Get `f_hid.c` / `u_hid.h`
 
 There's no exact-source-match package for this vendor kernel (no `deb-src`
-line configured, `apt-get source` fails). Instead, pulled from Debian's
-`linux-source-7.0` package — a reasonable substitute because the gadget
-function API surface (`struct usb_function_instance`,
-`linux/usb/composite.h`, `linux/usb/func_utils.h`, ...) is stable across
-point releases, and those exact headers were confirmed present, unmodified,
-in the Arduino headers package before attempting the build:
+line configured, `apt-get source` fails). Use Debian's `linux-source-7.0`
+package instead — the gadget function API surface (`struct
+usb_function_instance`, `linux/usb/composite.h`, `linux/usb/func_utils.h`,
+...) is stable across point releases, and those headers match the ones in
+the Arduino headers package:
 
 ```bash
 cd /tmp/hidwork
@@ -94,23 +80,6 @@ cp src/linux-source-7.0/drivers/usb/gadget/function/f_hid.c  /home/arduino/hid-g
 cp src/linux-source-7.0/drivers/usb/gadget/function/u_hid.h  /home/arduino/hid-gadget/module/
 ```
 
-`f_hid.c` and `u_hid.h` are **unmodified upstream copies** — the only
-authored file is `module/Makefile`, a minimal Kbuild stanza (building one
-function standalone doesn't need the full
-`drivers/usb/gadget/function/Makefile`, which builds every function in the
-tree):
-
-```make
-obj-m := usb_f_hid.o
-usb_f_hid-y := f_hid.o
-
-KDIR ?= /lib/modules/$(shell uname -r)/build
-PWD  := $(shell pwd)
-
-default:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
-```
-
 ### 3.3 Build
 
 ```bash
@@ -118,33 +87,7 @@ cd /home/arduino/hid-gadget/module
 make KDIR=/tmp/hidwork/headers-extracted/usr/src/linux-headers-7.0.0-g122c2c22d838
 ```
 
-Compiled clean, no warnings:
-
-```
-  CC [M]  f_hid.o
-  LD [M]  usb_f_hid.o
-  MODPOST Module.symvers
-  CC [M]  usb_f_hid.mod.o
-  LD [M]  usb_f_hid.ko
-```
-
-### 3.4 Verify
-
-```bash
-strings module/usb_f_hid.ko | grep -E "vermagic|depends"
-# vermagic=7.0.0-g122c2c22d838 SMP preempt mod_unload aarch64
-# depends=libcomposite
-uname -r
-# 7.0.0-g122c2c22d838
-```
-
-`vermagic` matches the running kernel exactly, and the only dependency
-(`libcomposite`) is already loaded — so it `modprobe`s with no `depmod`
-against a differently-versioned tree.
-
 ## 4. Installing the module
-
-Root required from here on.
 
 ```bash
 sudo mkdir -p /lib/modules/$(uname -r)/extra
@@ -159,34 +102,12 @@ sudo modprobe usb_f_hid && echo OK
 gadget's UDC gets unbound and rebound, which drops any SSH session tunneled
 through it.
 
-### 5.1 Original prototype (`test-hid-live.sh`, keyboard only)
-
-```bash
-sudo /home/arduino/hid-gadget/test-hid-live.sh add
-```
-
 On the host, confirm a 4th interface, HID class:
 
 ```bash
 lsusb -v -d 2341:0078 | grep -E 'bNumInterfaces|bInterfaceClass|iInterface'
 # bNumInterfaces: 0x04, one bInterfaceClass: 0x03 (HID)
 ```
-
-Click into a text field on the host, then:
-
-```bash
-sudo /home/arduino/hid-gadget/test-hid-live.sh tap-a
-```
-
-An `a` should appear. Revert when done (or just reboot — nothing here is
-persistent yet):
-
-```bash
-sudo /home/arduino/hid-gadget/test-hid-live.sh revert
-```
-
-**Verified**: interface count/class correct, keystroke landed, `adb`
-survived the unbind/rebind cycle.
 
 ### 5.2 Both functions via `arduino-hid-gadget` itself
 
@@ -222,8 +143,6 @@ command (or reboot, since nothing is persistent yet):
 ```bash
 sudo /home/arduino/hid-gadget/arduino-hid-gadget teardown
 ```
-
-**Not yet verified** against real hardware — see the Status note at the top.
 
 ## 6. Making it persistent across boots
 

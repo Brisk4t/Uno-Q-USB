@@ -1,5 +1,7 @@
 # USB HID gadget function on UNO Q
 
+![Demo](UnoQHid.gif)
+
 Adds two HID functions to the board's existing ADB USB gadget (`g1`), exposed
 as one compound device: a boot-protocol keyboard (`hid.usb0`) and a 3-axis /
 2-button game controller (`hid.usb1`).
